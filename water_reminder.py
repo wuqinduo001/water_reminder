@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """💧 喝水提醒"""
 
-import sys, time, json, threading, os, tkinter as tk
+import sys, time, json, threading, os, tkinter as tk, ctypes
 from datetime import date
+
+# ── 单实例保护（最先执行）─────────────────────────────────
+_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "WaterReminder_SingleInstance_v1")
+if ctypes.windll.kernel32.GetLastError() == 183:   # ERROR_ALREADY_EXISTS
+    ctypes.windll.user32.MessageBoxW(0, "喝水提醒已在运行中，请查看右下角任务栏托盘。", "提示", 0x40)
+    sys.exit(0)
 
 try:
     import customtkinter as ctk
     from PIL import Image, ImageDraw
     import pystray
 except ImportError:
-    print("请先安装依赖：\npip install customtkinter pillow pystray")
+    ctypes.windll.user32.MessageBoxW(
+        0, "缺少依赖，请运行：\npip install customtkinter pillow pystray", "缺少依赖", 0x10)
     sys.exit(1)
 
+# ── 配置 ──────────────────────────────────────────────────
 CFG_FILE = os.path.join(os.path.expanduser("~"), ".water_reminder.json")
 DEFAULTS = dict(interval=30, goal=8, snooze=5, today_date="", today_count=0)
 
-BG    = "#0F1829"
 CARD  = "#1C2742"
 BLUE  = "#4B9EFF"
 BLUE2 = "#2B7FFF"
@@ -65,20 +72,24 @@ class ReminderPopup:
             self.win.lift()
             return
 
+        # ── 从 root 获取屏幕尺寸（root 已初始化，始终可靠）
+        sw = self.app.root.winfo_screenwidth()
+        sh = self.app.root.winfo_screenheight()
         W, H = self.W, self.H
+
+        # ── withdraw → overrideredirect → deiconify
+        # 这是 Windows 上去掉标题栏且不闪烁的标准做法
         win = tk.Toplevel(self.app.root)
-        win.overrideredirect(True)
+        win.withdraw()                      # 先隐藏，避免标题栏闪烁
+        win.overrideredirect(True)          # 去掉标题栏
         win.attributes("-topmost", True)
         win.attributes("-alpha", 0.0)
-        win.configure(bg=BG)
-        win.wm_attributes("-transparentcolor", BG)   # BG 透明 → 视觉圆角
+        win.configure(bg=CARD)             # bg=CARD，与卡片颜色一致，不需要 transparentcolor
+        win.geometry(f"{W}x{H}+{sw + 20}+{sh - H - 62}")  # 初始在屏幕右侧外
+        win.deiconify()                    # 重新显示（此时已无标题栏，alpha=0 不可见）
+        win.update_idletasks()
 
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
-        # 初始在屏幕右侧外，动画滑入
-        win.geometry(f"{W}x{H}+{sw + 20}+{sh - H - 62}")
         self.win = win
-
         win.bind("<Escape>", lambda e: self._close())
 
         self._build_ui(W, H)
@@ -87,16 +98,16 @@ class ReminderPopup:
     def _build_ui(self, W, H):
         card = ctk.CTkFrame(self.win, width=W, height=H,
                             corner_radius=18, fg_color=CARD,
-                            border_width=1, border_color="#223060")
+                            border_width=1, border_color="#2B4080")
         card.place(x=0, y=0)
         card.pack_propagate(False)
         self._card = card
 
-        # 关闭按钮（x=W-48，远离圆角区域，确保可点击）
+        # 关闭按钮
         ctk.CTkButton(card, text="✕", width=26, height=26,
                       fg_color="transparent", hover_color=SEC,
                       text_color=MUTED, font=ctk.CTkFont(size=13),
-                      command=self._close).place(x=W - 48, y=10)
+                      command=self._close).place(x=W - 46, y=10)
 
         ctk.CTkLabel(card, text="💧", font=ctk.CTkFont(size=36)).pack(pady=(18, 0))
 
@@ -118,7 +129,6 @@ class ReminderPopup:
         bar.set(pct)
         bar.pack(pady=(6, 14))
 
-        # 按钮行
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack()
         self._btn_row = row
@@ -134,7 +144,7 @@ class ReminderPopup:
                       text_color="white", font=ctk.CTkFont(size=12, weight="bold"),
                       command=self._drink).pack(side="left")
 
-        # 底部倒计时细条（30 秒后自动消失）
+        # 底部倒计时条
         cbar = ctk.CTkProgressBar(card, width=260, height=3,
                                    corner_radius=2,
                                    progress_color=MUTED, fg_color="transparent")
@@ -142,7 +152,6 @@ class ReminderPopup:
         cbar.pack(pady=(10, 8))
         self._cbar = cbar
 
-        # 拖拽（跳过按钮，避免干扰点击）
         self._bind_drag(card)
 
     def _bind_drag(self, widget):
@@ -160,14 +169,16 @@ class ReminderPopup:
         if self.win and self.win.winfo_exists():
             self.win.geometry(f"+{event.x_root - self._drag_x}+{event.y_root - self._drag_y}")
 
-    # ── 滑入动画 ──────────────────────────────────────────
+    # ── 滑入动画（ease-out，从右侧滑入）─────────────────────
     def _animate_in(self, sw, sh, step=0, total=18):
         if not self.win or not self.win.winfo_exists():
             return
         t    = step / total
-        ease = 1 - (1 - t) ** 2          # ease-out quad
+        ease = 1 - (1 - t) ** 2
         W, H = self.W, self.H
-        x = int((sw + 20) + (sw - W - 20 - sw - 20) * ease)
+        start_x  = sw + 20
+        target_x = sw - W - 20
+        x = int(start_x + (target_x - start_x) * ease)
         self.win.geometry(f"{W}x{H}+{x}+{sh - H - 62}")
         self.win.attributes("-alpha", min(ease * 1.5, 1.0))
         if step < total:
@@ -218,7 +229,6 @@ class ReminderPopup:
     def _drink(self):
         self._cancel_countdown()
         self.app.drink()
-        # 成功反馈：变绿 → 0.9s 后淡出
         if self._card and self._card.winfo_exists():
             self._card.configure(border_color=GREEN)
         if self._title and self._title.winfo_exists():
@@ -374,7 +384,6 @@ class App:
         threading.Thread(target=loop, daemon=True).start()
 
     def _start_tray_updater(self):
-        """每 30 秒更新托盘 tooltip：今日进度 + 距下次提醒"""
         def loop():
             while True:
                 remaining = max(0, int((self._next - time.time()) / 60))
@@ -383,7 +392,7 @@ class App:
                     self._tray.title = f"喝水提醒  今日 {cnt}/{goal} 杯 · {remaining} 分钟后提醒"
                 except Exception:
                     pass
-                time.sleep(30)
+                time.sleep(60)
         threading.Thread(target=loop, daemon=True).start()
 
     def _setup_tray(self):
